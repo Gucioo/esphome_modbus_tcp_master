@@ -74,19 +74,22 @@ public:
 
     void loop() override {
         uint32_t now = millis();
-        
-        // Non-blocking connection health check - keep 5 second interval
-        if (now - last_connection_attempt_ > 5000) {
-            last_connection_attempt_ = now;
-            start_connection_check();  // Start non-blocking check
-        }
-        
-        // Process connection check state machine (non-blocking, max 5ms per call)
-        process_connection_check();
-        
-        // Watchdog handling
-        if (watchdog_enabled_ && now - last_watchdog_time_ > watchdog_interval_) {
-            handle_watchdog();
+
+        if(is_enabled())
+        {
+            // Non-blocking connection health check - keep 5 second interval
+            if (now - last_connection_attempt_ > 5000) {
+                last_connection_attempt_ = now;
+                start_connection_check();  // Start non-blocking check
+            }
+            
+            // Process connection check state machine (non-blocking, max 5ms per call)
+            process_connection_check();
+            
+            // Watchdog handling
+            if (watchdog_enabled_ && now - last_watchdog_time_ > watchdog_interval_) {
+                handle_watchdog();
+            }
         }
         
         // Yield regularly for responsiveness
@@ -132,27 +135,35 @@ public:
         }
 
         std::vector<uint8_t> request = build_read_request(start_address, count, function);
-        
-        if (!send_data(sock, request)) {
-            ::close(sock);
-            response.error_message = "Send failed";
-            is_connected_ = false;
-            return response;
-        }
+        int retriesLeft = 12;
 
-        std::vector<uint8_t> resp_data = receive_data(sock);
+        while(retriesLeft>=0)
+        {
+            ESP_LOGW(TAG, "Sending # %d", 13 - retriesLeft);
+            if (!send_data(sock, request)) {
+                ::close(sock);
+                response.error_message = "Send failed";
+                is_connected_ = false;
+                return response;
+            }
+
+            std::vector<uint8_t> resp_data = receive_data(sock);
+
+            if (resp_data.empty()) {
+                response.error_message = "Receive failed";
+                //is_connected_ = false;
+                //return response;
+            }
+
+            if (parse_read_response(resp_data, response, function)) {
+                break;  // Successfully parsed
+                //is_connected_ = false;
+                //return response;
+            }
+            retriesLeft--;
+            delay(100);
+        }
         ::close(sock);
-
-        if (resp_data.empty()) {
-            response.error_message = "Receive failed";
-            is_connected_ = false;
-            return response;
-        }
-
-        if (!parse_read_response(resp_data, response, function)) {
-            is_connected_ = false;
-            return response;
-        }
 
         is_connected_ = true;
         response.success = true;
@@ -224,13 +235,18 @@ public:
         return success;
     }
 
+    void set_enabled(bool en) { this->enabled_ = en; if (!en) this->disconnect_(); }
+
+    bool is_enabled() const { return this->enabled_; }
+
 private:
     std::string host_;
     uint16_t port_;
     uint8_t unit_id_;
-    bool is_connected_;
+    bool is_connected_ = true;
     uint32_t last_connection_attempt_;
     uint16_t transaction_id_ = 1;
+    uint16_t bytes_count_;
     
     // Watchdog variables
     uint16_t watchdog_register_;
@@ -239,6 +255,8 @@ private:
     uint32_t last_watchdog_time_;
     uint16_t watchdog_counter_;
     bool safe_mode_active_;
+    bool enabled_ = true;
+  
     
     // Non-blocking connection check state machine
     enum class ConnectionCheckState {
@@ -508,6 +526,9 @@ private:
     }
 
     bool send_data(int sock, const std::vector<uint8_t>& data) {
+
+        logVectorHex(data, "TX data");
+
         int sent = ::send(sock, data.data(), data.size(), 0);
         if (sent != (int)data.size()) {
             ESP_LOGV(TAG, "Send failed: %d/%d bytes", sent, data.size());
@@ -518,7 +539,7 @@ private:
 
     std::vector<uint8_t> receive_data(int sock) {
         std::vector<uint8_t> data;
-        uint8_t buffer[256];
+        uint8_t buffer[1256];
         
         int len = ::recv(sock, buffer, sizeof(buffer), 0);
         if (len > 0) {
@@ -526,6 +547,21 @@ private:
         }
         
         return data;
+    }
+
+    void logVectorHex(const std::vector<uint8_t> &data, const char *prefix = "Data") {
+        const size_t BUF_SIZE = 200 + data.size() * 3;
+        char buf[BUF_SIZE];
+        size_t offset = 0;
+
+        // write prefix
+        offset += snprintf(buf + offset, BUF_SIZE - offset, "%s (%u bytes): ", prefix, (unsigned int)data.size());
+
+        // write each byte
+        for (size_t i = 0; i < data.size() && offset < BUF_SIZE; i++) {
+            offset += snprintf(buf + offset, BUF_SIZE - offset, "%02X ", data[i]);
+        }
+        ESP_LOGW(TAG, "%s", buf);
     }
 
     std::vector<uint8_t> build_read_request(uint16_t address, uint16_t count, ModbusFunction function) {
@@ -586,6 +622,9 @@ private:
     }
 
     bool parse_read_response(const std::vector<uint8_t>& data, ModbusResponse& response, ModbusFunction function) {
+
+        logVectorHex(data, "RX data");
+
         if (data.size() < 9) {
             response.error_message = "Response too short";
             return false;
@@ -603,12 +642,26 @@ private:
         }
 
         response.data.clear();
-        for (int i = 0; i < byte_count; i += 2) {
-            uint16_t value = (data[9 + i] << 8) | data[9 + i + 1];
-            response.data.push_back(value);
+        if( byte_count % 2 != 0) {
+            response.error_message = "Invalid byte count";
+            return false;
+        }
+        if( byte_count == 2) {
+            for (int i = 0; i < byte_count; i += 2) {
+                int16_t value = (data[9 + i] << 8) | data[9 + i + 1];
+                response.data.push_back(value);
+            }
+        }
+        if( byte_count == 4) {
+                int32_t value = (int32_t)((data[9]<<24)|(data[10]<<16)|(data[11]<<8)|data[12]);
+                response.data.push_back(value);
         }
 
         return true;
+    }
+
+    void disconnect_() {
+        this->is_connected_ = false;
     }
 };
 
@@ -616,9 +669,9 @@ private:
 class ModbusTCPSensor : public PollingComponent, public sensor::Sensor {
 public:
     ModbusTCPSensor(ModbusTCPManager *parent, uint16_t register_address, 
-                    uint8_t function_code, float scale, float offset, uint32_t update_interval) 
-        : parent_(parent), register_address_(register_address), 
-          function_code_(function_code), scale_(scale), offset_(offset) {
+                    uint8_t function_code, float scale, float offset, uint32_t update_interval, uint8_t unit_id, uint16_t registers_count) 
+        : parent_(parent), register_address_(register_address),
+          function_code_(function_code), scale_(scale), offset_(offset), unit_id_(unit_id), registers_count_(registers_count) {
         this->set_update_interval(update_interval);
     }
 
@@ -627,6 +680,12 @@ public:
     }
 
     void update() override {
+
+        if(!parent_->is_enabled()) {
+            ESP_LOGW(TAG, "Modbus is disabled, skipping read for register %d", register_address_);
+            return;
+        }
+
         if (!parent_->is_connected()) {
             ESP_LOGV(TAG, "Triggering connection check for register %d", register_address_);
             const_cast<ModbusTCPManager*>(parent_)->check_connection();
@@ -651,8 +710,8 @@ public:
             ModbusFunction::READ_INPUT_REGISTERS : 
             ModbusFunction::READ_HOLDING_REGISTERS;
 
-        ESP_LOGD(TAG, "Reading register %d", register_address_);
-        ModbusResponse response = parent_->read_register(register_address_, func);
+        ESP_LOGW(TAG, "Reading register %d", register_address_);
+        ModbusResponse response = parent_->read_registers(register_address_, registers_count_, func);
         
         if (response.success && !response.data.empty()) {
             int16_t raw_value = static_cast<int16_t>(response.data[0]);
@@ -674,6 +733,8 @@ private:
     uint8_t function_code_;
     float scale_;
     float offset_;
+    uint8_t unit_id_;
+    uint16_t registers_count_;
 };
 
 // Connection status sensor

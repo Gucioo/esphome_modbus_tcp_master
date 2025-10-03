@@ -12,6 +12,8 @@ CONF_REGISTER_ADDRESS = "register_address"
 CONF_FUNCTION_CODE = "function_code"
 CONF_SCALE = "scale"
 CONF_OFFSET = "offset"
+CONF_UNIT_ID = "unit_id"
+CONF_REGISTERS_COUNT = "registers_count"
 
 # Import from main component
 from . import modbus_tcp_ns, ModbusTCPManager
@@ -29,6 +31,8 @@ CONFIG_SCHEMA = sensor.sensor_schema(ModbusTCPSensor).extend({
     cv.Optional(CONF_SCALE, default=0.1): cv.float_,
     cv.Optional(CONF_OFFSET, default=0.0): cv.float_,
     cv.Optional(CONF_UPDATE_INTERVAL, default="30s"): cv.update_interval,
+    cv.Optional(CONF_UNIT_ID, default=1): cv.int_range(min=1, max=255),
+    cv.Optional(CONF_REGISTERS_COUNT, default=1): cv.int_range(min=1, max=4),
 }).extend(cv.COMPONENT_SCHEMA)
 
 async def to_code(config):
@@ -42,6 +46,8 @@ async def to_code(config):
         config[CONF_SCALE],
         config[CONF_OFFSET],
         config[CONF_UPDATE_INTERVAL].total_milliseconds,
+        config[CONF_UNIT_ID],
+        config[CONF_REGISTERS_COUNT]
     )
     
     await cg.register_component(var, config)
